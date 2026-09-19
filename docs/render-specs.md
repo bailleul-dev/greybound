@@ -5,8 +5,15 @@ For AI generation prompts and a reusable layout guide, see `ai-asset-generation.
 
 ## Pedal Assets
 
-- Logical display size: `300 x 543`
-- Recommended PNG size for new assets: `1200 x 2172` (`4x`)
+- Three enclosure formats share one scale of 4 logical px per mm; see
+  `knowledge/architecture/pedal-formats.mdx` and `ui/src/pedal_format.rs`:
+  - `Compact`: logical `192 x 408`, PNG `768 x 1632`
+  - `Standard`: logical `300 x 543`, PNG `1200 x 2172`
+  - `Wide`: logical `412 x 543`, PNG `1648 x 2172`
+- New pedals declare `layout: RenderLayoutPolicy::PedalGrid(format)` and build
+  controls with `grid_pot` / `grid_control` / `grid_led` / `grid_footswitch`.
+  Hand-set anchors and radii are rejected by `validate_pedal_layout`.
+- The board draws all pedals at one shared scale on a common bottom edge.
 - Existing generated assets may still use legacy sizes. Known accepted legacy
   sizes are `1200 x 2260` for early full-height renders and `914 x 1721` for
   the cropped Minotaur render. When touching them, prefer regenerating or

@@ -1,0 +1,167 @@
+---
+title: Pedal Formats
+description: The three standard pedal enclosures, their shared physical scale, and the constrained control grid.
+---
+
+Greybound pedals come in three enclosure formats. Each format fixes the body
+size, where controls can go, how big they can be, and where the LED,
+footswitch, and side jacks sit. Pedals no longer carry hand-tuned
+coordinates or radii.
+
+Source of truth: `ui/src/pedal_format.rs`. The UI, the UI tests, and
+`cargo xtask pedal-assets` all read the same `PedalFormatSpec`.
+
+## Why
+
+Before this standard, all nine rendered pedals used one canvas, but every
+pedal set its own geometry by hand:
+
+- knob radii from 20 to 41 logical px (7 distinct values);
+- footswitch `y` from 0.774 to 0.841 with 3 radii (31, 40, 54);
+- the LED placed anywhere from the top edge (Muffin, `y=0.073`) to just above
+  the footswitch;
+- column positions such as 0.234, 0.246, 0.25, 0.268, 0.278, 0.28, 0.292 for
+  what is really "the left column";
+- three faceplate PNG sizes (`1200x2172`, `1200x2260`, `914x1721`).
+
+The xtask construction guide also put the side jacks at `y≈1086` source px
+while the runtime draws them at `y≈1255`. Image models were given a wrong
+reference.
+
+## Shared physical scale
+
+All formats use **4 logical px per mm** of enclosure, with faceplates exported
+at `@4x` (16 source px per mm). Every canvas has an 18 logical px (4.5 mm)
+transparent margin for the body's soft shadow and the side jacks.
+
+On the board, every pedal is drawn at **one shared scale**, so a Compact is
+visibly smaller than a Wide. Pedals share a bottom edge, like enclosures
+standing on a real board. A board made only of Standard pedals is laid out
+exactly as before (covered by `standard_board_layout_is_unchanged`).
+
+## Formats
+
+| Format | Enclosure class | Body (mm) | Logical canvas | Source PNG | Columns | Rows |
+|---|---|---|---|---|---|---|
+| `Compact` | Hammond 1590A (38.5 x 92.6) | 39 x 93 | 192 x 408 | 768 x 1632 | 1–2 | A, B |
+| `Standard` | Hammond 125B (66 x 122) | 66 x 126.75 | 300 x 543 | 1200 x 2172 | 1–3 | A, B, C |
+| `Wide` | Hammond 1590BB (94 x 119.5) | 94 x 126.75 | 412 x 543 | 1648 x 2172 | 1–4 | A, B, C |
+
+Deliberate deviations from the real enclosures:
+
+- Standard keeps the pre-existing Greybound canvas (126.75 mm long rather than
+  122 mm), so every legacy faceplate stays valid.
+- Wide keeps the Standard length rather than 119.5 mm, so footswitches line
+  up across the board.
+
+## Grid
+
+Positions are logical px from the top-left corner of the enclosure body.
+
+| | Compact | Standard | Wide |
+|---|---|---|---|
+| Row A | 56 | 70 | 70 |
+| Row B | 146 | 172 | 172 |
+| Row C | — | 274 | 274 |
+| LED (centred) | 218 | 345 | 345 |
+| Footswitch (centred) | 292 | 427 | 427 |
+| Side jacks | 217 | 295.8 | 295.8 |
+
+Columns are fractions of the body width:
+
+- 1 column: 0.5
+- 2 columns: 0.25, 0.75
+- 3 columns: 0.2, 0.5, 0.8
+- 4 columns: 0.125, 0.375, 0.625, 0.875
+
+Each row can use a different column count. For example, the Delay's classic
+triangle is 2 columns on row A and 1 column on row B.
+
+## Sizes
+
+| Part | Radius (logical px) | Diameter | Hit radius |
+|---|---|---|---|
+| `KnobTier::Small` | 22 | 11 mm | 40 |
+| `KnobTier::Medium` | 30 | 15 mm | 48 |
+| `KnobTier::Large` | 38 | 19 mm | 56 |
+| Footswitch | 31 | 15.5 mm | 50 |
+| LED | 16 | 8 mm | none |
+
+Labels follow one rule: the baseline sits `max(44.25, radius + 20)` px below
+the control centre (above it for sliders), with a conservative width of
+7.5 px per character plus 9 px.
+
+## Authoring a pedal
+
+Build controls with the `const` builders. An invalid slot, such as a 4th
+column on Standard or row C on Compact, is a **compile error**:
+
+```rust
+pub const DELAY_PEDAL_CONTROLS: &[RenderControlSpec] = &[
+    grid_pot(PedalFormat::Standard, PedalRow::A, 2, 0, KnobTier::Medium, ControlKind::Gain, "Time", KnobSkin::Teal, None),
+    grid_pot(PedalFormat::Standard, PedalRow::A, 2, 1, KnobTier::Medium, ControlKind::Treble, "Feedback", KnobSkin::Teal, None),
+    grid_pot(PedalFormat::Standard, PedalRow::B, 1, 0, KnobTier::Medium, ControlKind::Master, "Mix", KnobSkin::Teal, None),
+    grid_footswitch(PedalFormat::Standard, KnobSkin::Teal, None),
+];
+```
+
+Then declare `layout: RenderLayoutPolicy::PedalGrid(PedalFormat::Standard)`
+and `surface: STANDARD_PEDAL_SURFACE` (or `COMPACT_PEDAL_SURFACE` /
+`WIDE_PEDAL_SURFACE`) on the `ModelRenderSpec`. Use `grid_control` for
+sliders and toggles, and `grid_led` for the status LED.
+
+## Gates
+
+`validate_pedal_layout` runs in the UI tests and in every `pedal-assets`
+command.
+
+- **All pedals:** controls and labels stay inside the body, and no controls,
+  labels, or label/label pairs overlap (3 px clearance).
+- **Grid pedals:** the surface matches the format, any faceplate PNG has the
+  format's source size, there is exactly one footswitch, every control sits
+  on a grid slot / LED / footswitch position, and every size is a tier.
+- `new_pedals_must_use_a_format_grid` fails for any freeform pedal that is not
+  on the legacy allowlist.
+- `every_format_fits_its_densest_template` proves each format's densest
+  intended layout passes (Compact: 2 small + 1 medium; Standard: 3+3+2
+  medium; Wide: 4+4+3 medium).
+
+The grid does not guarantee that every combination fits. For example, Large
+knobs on consecutive rows or a Large knob on row C directly above the LED are
+rejected by the gate. Pick a smaller tier or a sparser row.
+
+## Migration status
+
+On the Standard grid (no faceplate PNG, so no visual risk): Delay, Reverb, and
+the Nox30 / Wide Combo / Lead Head amp-pedal fallbacks. Their knobs moved from
+hand-set r=33 at x=0.25/0.75 to Medium r=30 at x=0.28/0.72.
+
+Legacy freeform, pinned by baked faceplates (`LEGACY_FREEFORM_PEDALS` in the UI
+tests): Minotaur, NAM Pedal, Monarch, Muffin, Lumen, Springfield, Auralith.
+Their exported contracts are unchanged except for the jack zone fix. Each
+one leaves the list when its faceplate is regenerated as an empty
+`DrawnByUi` enclosure on a format grid. Auralith (6 knobs) is the natural
+first `Wide` candidate. `cab.ir` stays freeform because it is not an
+enclosure.
+
+## Templates and tooling
+
+```bash
+# Regenerate the per-format mechanical templates from PedalFormatSpec.
+cargo run -p xtask -- pedal-assets formats docs/templates
+```
+
+This writes `docs/templates/pedal-{compact-768x1632,standard-1200x2172,wide-1648x2172}.svg`.
+Do not edit them by hand. `pedal-assets export|prompt|validate|preview` read
+the canvas, body bounds, and jack zone from the pedal's format. Contracts are
+now `greybound.pedal-asset-contract/v2` and include an `enclosure` block.
+
+## Open items
+
+- The vector fallback body (`draw_pedal` without an asset) still draws its
+  title, texture plate, and LED at hard-coded fractions (0.56, 0.64, 0.69)
+  instead of reading the format.
+- Control radii are not scaled when the board shrinks below scale 1.0. This
+  predates the formats.
+- No Compact or Wide pedal exists yet. Their grids are validated only by the
+  synthetic densest-template test, not by an in-app visual pass.

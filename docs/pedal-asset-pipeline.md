@@ -21,6 +21,18 @@ The model-owned recipe is `PedalAssetGenerationSpec`, colocated with its
 destination, and art direction; `RenderControlSpec` is the single source of
 truth for all hardware anchors, assets, rotation pivots, labels, and hit areas.
 
+## Pick a format first
+
+Every pedal uses one of three enclosure formats: `Compact`, `Standard`, or
+`Wide` (`ui/src/pedal_format.rs`). The format fixes the canvas, the control
+grid, knob tiers, and the LED, footswitch, and jack positions. See
+`knowledge/architecture/pedal-formats.mdx`. Regenerate the per-format
+mechanical templates with:
+
+```bash
+cargo run -p xtask -- pedal-assets formats docs/templates
+```
+
 ## Regenerate from scratch
 
 From `greybound/`:
@@ -75,8 +87,12 @@ Regenerate on failure.
 
 A candidate is eligible only when all of the following are true:
 
-- It is a `1200 × 2172` RGBA PNG with transparent corners.
-- Its visible enclosure stays inside `x=72..1128`, `y=72..2100`.
+- It is an RGBA PNG at its format's source size (Compact `768 × 1632`,
+  Standard `1200 × 2172`, Wide `1648 × 2172`) with transparent corners.
+- Its visible enclosure stays inside the body bounds: a 72 px margin on every
+  side (Standard: `x=72..1128`, `y=72..2100`).
+- The model is on `RenderLayoutPolicy::PedalGrid(format)` and its controls are
+  built with the `grid_*` helpers (see `knowledge/architecture/pedal-formats.mdx`).
 - It is an orthographic empty faceplate: no baked functional hardware or
   control typography.
 - The model wordmark is the only optional raster text. Editable control labels

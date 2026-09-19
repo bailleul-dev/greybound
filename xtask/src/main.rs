@@ -1,6 +1,11 @@
 use anyhow::{bail, Context};
+use greybound_ui::pedal_format::{
+    pedal_label_baseline_offset, pedal_label_width, validate_pedal_layout, PEDAL_CANVAS_MARGIN,
+    PEDAL_LABEL_HEIGHT, PEDAL_SOURCE_SCALE,
+};
 use greybound_ui::{
-    AppProfile, ModelRenderSpec, RenderControlRole, RenderControlWidget, RenderSurfaceKind,
+    AppProfile, ModelRenderSpec, PedalFormat, RenderControlRole, RenderControlWidget,
+    RenderLayoutPolicy, RenderSurfaceKind,
 };
 use image::GenericImageView;
 use serde_json::json;
@@ -8,16 +13,52 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const PEDAL_SOURCE_WIDTH: u32 = 1200;
-const PEDAL_SOURCE_HEIGHT: u32 = 2172;
-const PEDAL_BODY_LEFT: f32 = 72.0;
-const PEDAL_BODY_TOP: f32 = 72.0;
-const PEDAL_BODY_RIGHT: f32 = 1128.0;
-const PEDAL_BODY_BOTTOM: f32 = 2100.0;
-const LABEL_BASELINE_OFFSET: f32 = 177.0;
-const LABEL_HEIGHT: f32 = 32.0;
-const LABEL_SIDE_PADDING: f32 = 18.0;
-const COMPONENT_CLEARANCE: f32 = 12.0;
+const JACK_ZONE_HALF_HEIGHT: f32 = 68.0;
+
+/// Source-pixel geometry of one pedal faceplate, derived from its format.
+#[derive(Debug, Clone, Copy)]
+struct SourceGeometry {
+    format: PedalFormat,
+    width: u32,
+    height: u32,
+    body_left: f32,
+    body_top: f32,
+    body_right: f32,
+    body_bottom: f32,
+    jack_y: f32,
+}
+
+impl SourceGeometry {
+    fn of(render: &ModelRenderSpec) -> Self {
+        let format = match render.layout {
+            RenderLayoutPolicy::PedalGrid(format) => format,
+            // Legacy freeform faceplates all live on the Standard canvas.
+            RenderLayoutPolicy::Freeform => PedalFormat::Standard,
+        };
+        let spec = format.spec();
+        let margin = PEDAL_CANVAS_MARGIN * PEDAL_SOURCE_SCALE;
+        let width = spec.surface.recommended_pixel_width;
+        let height = spec.surface.recommended_pixel_height;
+        Self {
+            format,
+            width,
+            height,
+            body_left: margin,
+            body_top: margin,
+            body_right: width as f32 - margin,
+            body_bottom: height as f32 - margin,
+            jack_y: spec.jack_anchor_y() * height as f32,
+        }
+    }
+
+    fn x(&self, anchor_x: f32) -> f32 {
+        anchor_x * self.width as f32
+    }
+
+    fn y(&self, anchor_y: f32) -> f32 {
+        anchor_y * self.height as f32
+    }
+}
 
 fn main() -> nih_plug_xtask::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -44,7 +85,7 @@ fn main() -> nih_plug_xtask::Result<()> {
 
 fn pedal_assets(args: Vec<String>) -> anyhow::Result<()> {
     let Some(command) = args.first().map(String::as_str) else {
-        bail!("Usage: cargo xtask pedal-assets <export <dir>|prompt <model-id>|validate <model-id> <png>|preview <model-id> <png> <out.png>>");
+        bail!("Usage: cargo xtask pedal-assets <export <dir>|formats <dir>|prompt <model-id>|validate <model-id> <png>|preview <model-id> <png> <out.png>>");
     };
 
     match command {
@@ -54,6 +95,13 @@ fn pedal_assets(args: Vec<String>) -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("docs/generated/pedal-asset-contracts"));
             export_pedal_contracts(&output)
+        }
+        "formats" => {
+            let output = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("docs/templates"));
+            export_format_templates(&output)
         }
         "prompt" => {
             let model_id = args
@@ -91,7 +139,7 @@ fn pedal_assets(args: Vec<String>) -> anyhow::Result<()> {
             Ok(())
         }
         _ => {
-            bail!("Unknown pedal-assets command '{command}'. Expected export, prompt, validate, or preview.")
+            bail!("Unknown pedal-assets command '{command}'. Expected export, formats, prompt, validate, or preview.")
         }
     }
 }
@@ -143,40 +191,138 @@ fn export_pedal_contracts(output: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes one mechanical template per enclosure format, generated from the same
+/// `PedalFormatSpec` the UI and validator use.
+fn export_format_templates(output: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(output).with_context(|| format!("Could not create {}", output.display()))?;
+    for format in PedalFormat::ALL {
+        let spec = format.spec();
+        let path = output.join(format!(
+            "pedal-{}-{}x{}.svg",
+            spec.id, spec.surface.recommended_pixel_width, spec.surface.recommended_pixel_height
+        ));
+        fs::write(&path, format_template(format))
+            .with_context(|| format!("Could not write {}", path.display()))?;
+        println!("Wrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn format_template(format: PedalFormat) -> String {
+    let spec = format.spec();
+    let px = |logical: f32| logical * PEDAL_SOURCE_SCALE;
+    let width = spec.surface.recommended_pixel_width;
+    let height = spec.surface.recommended_pixel_height;
+    let margin = px(PEDAL_CANVAS_MARGIN);
+    let body_width = px(spec.body_width);
+    let body_height = px(spec.body_height);
+    let jack_y = spec.jack_anchor_y() * height as f32;
+    let jack_top = jack_y - JACK_ZONE_HALF_HEIGHT;
+    let jack_height = JACK_ZONE_HALF_HEIGHT * 2.0;
+    let right_jack = margin + body_width;
+    let body_x = |fraction: f32| margin + body_width * fraction;
+    let body_y = |logical: f32| margin + px(logical);
+
+    let mut slots = String::new();
+    for (row_index, row) in spec.rows.iter().enumerate() {
+        let y = body_y(*row);
+        let name = ["A", "B", "C"][row_index];
+        slots.push_str(&format!(
+            "    <line x1=\"{margin}\" y1=\"{y:.1}\" x2=\"{right_jack}\" y2=\"{y:.1}\"/>\n    <text x=\"{text_x}\" y=\"{text_y:.1}\">ROW {name}</text>\n",
+            text_x = margin + 16.0,
+            text_y = y - 12.0,
+        ));
+        for columns in 1..=spec.max_columns {
+            for index in 0..columns {
+                let x = body_x(greybound_ui::pedal_format::column_fraction(columns, index));
+                slots.push_str(&format!(
+                    "    <circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"6\"/>\n"
+                ));
+            }
+        }
+    }
+    let mut tiers = String::new();
+    for tier in greybound_ui::KnobTier::ALL {
+        tiers.push_str(&format!("{:?} r={} px, ", tier, px(tier.radius())));
+    }
+    let center_x = body_x(0.5);
+    let led_y = body_y(spec.led_y);
+    let footswitch_y = body_y(spec.footswitch_y);
+    let led_radius = px(greybound_ui::pedal_format::PEDAL_LED_RADIUS);
+    let footswitch_radius = px(greybound_ui::pedal_format::PEDAL_FOOTSWITCH_RADIUS);
+
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <title>Greybound {id} pedal mechanical template</title>
+  <desc>
+    Generated by `cargo xtask pedal-assets formats` from PedalFormatSpec; do not edit by hand.
+    Enclosure class: {enclosure}. Body {body_mm_w} x {body_mm_h} mm at 16 source px/mm.
+    Control slots are the only permitted anchors: rows {rows}, 1..{max_columns} columns.
+    Knob tiers: {tiers}footswitch r={footswitch_radius} px, LED r={led_radius} px.
+    Guides must not appear in final artwork.
+  </desc>
+  <rect x="2" y="2" width="{inner_w}" height="{inner_h}" fill="none" stroke="#64748b" stroke-width="4"/>
+  <rect x="{margin}" y="{margin}" width="{body_width}" height="{body_height}" rx="72" fill="none" stroke="#00a7ff" stroke-width="6" stroke-dasharray="24 18"/>
+  <g fill="#ffb347" fill-opacity="0.14" stroke="#ffb347" stroke-width="5" stroke-dasharray="14 12">
+    <rect x="0" y="{jack_top:.1}" width="{margin}" height="{jack_height}"/>
+    <rect x="{right_jack}" y="{jack_top:.1}" width="{margin}" height="{jack_height}"/>
+  </g>
+  <g stroke="#ff4fd8" stroke-width="2" stroke-dasharray="8 10" fill="#ff4fd8" font-family="Arial" font-size="28">
+{slots}  </g>
+  <g fill="none" stroke="#62d26f" stroke-width="4" stroke-dasharray="12 10">
+    <circle cx="{center_x:.1}" cy="{led_y:.1}" r="{led_radius}"/>
+    <circle cx="{center_x:.1}" cy="{footswitch_y:.1}" r="{footswitch_radius}"/>
+  </g>
+</svg>
+"##,
+        id = spec.id,
+        enclosure = spec.reference_enclosure,
+        body_mm_w = spec.body_width_mm(),
+        body_mm_h = spec.body_height_mm(),
+        rows = spec.rows.len(),
+        max_columns = spec.max_columns,
+        inner_w = width - 4,
+        inner_h = height - 4,
+    )
+}
+
 fn pedal_contract(model_id: &str, render: &ModelRenderSpec) -> serde_json::Value {
     let generation = render.generation.expect("filtered to regenerable pedals");
+    let geometry = SourceGeometry::of(render);
     let controls = render.controls.iter().map(|control| {
-        let x = control.anchor_x * PEDAL_SOURCE_WIDTH as f32;
-        let y = control.anchor_y * PEDAL_SOURCE_HEIGHT as f32;
+        let x = geometry.x(control.anchor_x);
+        let y = geometry.y(control.anchor_y);
         json!({
             "role": control_role(control.role),
             "widget": control_widget(control.widget),
             "label": control.label,
             "anchor": { "normalized": { "x": control.anchor_x, "y": control.anchor_y }, "source_px": { "x": x, "y": y } },
-            "radius": { "logical_px": control.radius, "source_px": control.radius * 4.0 },
+            "radius": { "logical_px": control.radius, "source_px": control.radius * PEDAL_SOURCE_SCALE },
             "hit_radius_logical_px": control.hit_radius,
             "dynamic_asset": control.asset.map(control_asset_contract),
-            "label_baseline_source_y": if matches!(control.role, RenderControlRole::Parameter(_)) { Some(label_baseline_source_y(control)) } else { None },
+            "label_baseline_source_y": if matches!(control.role, RenderControlRole::Parameter(_)) { Some(label_baseline_source_y(&geometry, control)) } else { None },
         })
     }).collect::<Vec<_>>();
 
     json!({
-        "schema": "greybound.pedal-asset-contract/v1",
+        "schema": "greybound.pedal-asset-contract/v2",
         "model_id": model_id,
+        "enclosure": enclosure_contract(render),
         "render_id": render.id,
         "recipe_version": generation.recipe_version,
         "output": {
             "faceplate_path": generation.faceplate_path,
             "format": "PNG RGBA",
-            "width": PEDAL_SOURCE_WIDTH,
-            "height": PEDAL_SOURCE_HEIGHT,
+            "width": geometry.width,
+            "height": geometry.height,
             "transparent_background": true,
         },
         "faceplate": {
             "model_name": generation.model_name,
             "art_direction": generation.art_direction,
             "view": "straight-on orthographic front elevation",
-            "body_bounds_source_px": { "x": PEDAL_BODY_LEFT, "y": PEDAL_BODY_TOP, "width": PEDAL_BODY_RIGHT - PEDAL_BODY_LEFT, "height": PEDAL_BODY_BOTTOM - PEDAL_BODY_TOP, "outer_radius": 72, "bevel": 24 },
+            "body_bounds_source_px": { "x": geometry.body_left, "y": geometry.body_top, "width": geometry.body_right - geometry.body_left, "height": geometry.body_bottom - geometry.body_top, "outer_radius": 72, "bevel": 24 },
+            "side_jack_center_source_y": geometry.jack_y,
             "must_not_contain": ["knobs", "knob holes", "control labels", "control ticks", "footswitch", "footswitch hole", "LED jewel", "LED socket", "toggle", "slider", "front screws", "front jacks", "drop shadow", "floor", "background"],
         },
         "deterministic_runtime_layer": {
@@ -187,6 +333,20 @@ fn pedal_contract(model_id: &str, render: &ModelRenderSpec) -> serde_json::Value
         "preflight_preview": "cargo xtask pedal-assets preview <model-id> <candidate.png> <inspection.png>",
         "controls": controls,
         "image_model_prompt": faceplate_prompt(render),
+    })
+}
+
+fn enclosure_contract(render: &ModelRenderSpec) -> serde_json::Value {
+    let geometry = SourceGeometry::of(render);
+    let spec = geometry.format.spec();
+    json!({
+        "format": spec.id,
+        "layout": match render.layout {
+            RenderLayoutPolicy::PedalGrid(_) => "grid",
+            RenderLayoutPolicy::Freeform => "legacy-freeform",
+        },
+        "reference_enclosure": spec.reference_enclosure,
+        "body_mm": { "width": spec.body_width_mm(), "height": spec.body_height_mm() },
     })
 }
 
@@ -222,33 +382,56 @@ fn control_widget(widget: RenderControlWidget) -> &'static str {
 
 fn faceplate_prompt(render: &ModelRenderSpec) -> String {
     let generation = render.generation.expect("filtered to regenerable pedals");
+    let geometry = SourceGeometry::of(render);
+    let spec = geometry.format.spec();
     format!(
         "Use case: product-mockup\nAsset type: Greybound pedal faceplate source art\n\
 Create exactly one EMPTY boutique guitar-pedal enclosure faceplate.\n\n\
-Canvas and camera:\n- exact canvas: {PEDAL_SOURCE_WIDTH} x {PEDAL_SOURCE_HEIGHT} px\n- straight-on orthographic front elevation; no perspective, no rotation\n- transparent background; no floor, environment, reflection, or shadow outside the enclosure\n- enclosure outer bounds: x=72..1128, y=72..2100; outer corner radius 72 px; visible bevel 24 px\n\n\
+Canvas and camera:\n- enclosure format: {format} ({enclosure}); keep its proportions\n- exact canvas: {width} x {height} px\n- straight-on orthographic front elevation; no perspective, no rotation\n- transparent background; no floor, environment, reflection, or shadow outside the enclosure\n- enclosure outer bounds: x={left}..{right}, y={top}..{bottom}; outer corner radius 72 px; visible bevel 24 px\n\n\
 Identity:\n- model wordmark (the only permitted text): \"{}\"\n- art direction: {}\n- premium photorealistic metal/enamel construction, crisp 4x detail\n\n\
 The application will place every functional component deterministically. Leave the entire face clean and uninterrupted.\n\n\
 Absolutely do not render: knobs, knob caps, knob holes, dial marks, labels, footswitch, footswitch hole, LED, LED socket, switches, sliders, jacks, screws, washers, nuts, bezels, UI, background, floor, or any cast/contact shadow.\n\n\
 Output only this empty enclosure as a PNG. The supplied construction SVG is a guide only and must not be visible in the output.\n",
-        generation.model_name, generation.art_direction
+        generation.model_name,
+        generation.art_direction,
+        format = spec.id,
+        enclosure = spec.reference_enclosure,
+        width = geometry.width,
+        height = geometry.height,
+        left = geometry.body_left,
+        right = geometry.body_right,
+        top = geometry.body_top,
+        bottom = geometry.body_bottom,
     )
 }
 
 fn construction_guide(model_id: &str, render: &ModelRenderSpec) -> String {
+    let geometry = SourceGeometry::of(render);
+    let (width, height) = (geometry.width, geometry.height);
+    let (left, top) = (geometry.body_left, geometry.body_top);
+    let body_width = geometry.body_right - geometry.body_left;
+    let body_height = geometry.body_bottom - geometry.body_top;
+    let jack_top = geometry.jack_y - JACK_ZONE_HALF_HEIGHT;
+    let jack_height = JACK_ZONE_HALF_HEIGHT * 2.0;
+    let jack_text_y = geometry.jack_y + 14.0;
+    let right_jack_x = geometry.body_right;
+    let in_x = left + 48.0;
+    let out_x = geometry.body_right - 48.0;
+
     let mut controls = String::new();
     for control in render.controls {
-        let x = control.anchor_x * PEDAL_SOURCE_WIDTH as f32;
-        let y = control.anchor_y * PEDAL_SOURCE_HEIGHT as f32;
-        let radius = control.radius * 4.0;
+        let x = geometry.x(control.anchor_x);
+        let y = geometry.y(control.anchor_y);
+        let radius = control.radius * PEDAL_SOURCE_SCALE;
         let label = xml_escape(control.label);
         controls.push_str(&format!(
             "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"{radius:.1}\" fill=\"#ff4fd8\" fill-opacity=\".12\" stroke=\"#ff4fd8\" stroke-width=\"4\" stroke-dasharray=\"16 12\"/><text x=\"{x:.1}\" y=\"{label_y:.1}\" fill=\"#ff4fd8\" font-family=\"Arial\" font-size=\"28\" text-anchor=\"middle\">{label}</text>\n",
-            label_y = label_baseline_source_y(control),
+            label_y = label_baseline_source_y(&geometry, control),
         ));
     }
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{PEDAL_SOURCE_WIDTH}\" height=\"{PEDAL_SOURCE_HEIGHT}\" viewBox=\"0 0 {PEDAL_SOURCE_WIDTH} {PEDAL_SOURCE_HEIGHT}\"><title>{}</title><rect width=\"{PEDAL_SOURCE_WIDTH}\" height=\"{PEDAL_SOURCE_HEIGHT}\" fill=\"none\" stroke=\"#64748b\" stroke-width=\"4\"/><rect x=\"72\" y=\"72\" width=\"1056\" height=\"2028\" rx=\"72\" fill=\"none\" stroke=\"#00a7ff\" stroke-width=\"6\" stroke-dasharray=\"24 18\"/><rect x=\"0\" y=\"1018\" width=\"72\" height=\"136\" fill=\"#ffb347\" fill-opacity=\".16\"/><rect x=\"1128\" y=\"1018\" width=\"72\" height=\"136\" fill=\"#ffb347\" fill-opacity=\".16\"/><text x=\"120\" y=\"1096\" fill=\"#ffb347\" font-family=\"Arial\" font-size=\"44\">IN</text><text x=\"1080\" y=\"1096\" fill=\"#ffb347\" font-family=\"Arial\" font-size=\"44\" text-anchor=\"end\">OUT</text>{controls}</svg>\n",
-        xml_escape(model_id)
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\"><title>{title}</title><rect width=\"{width}\" height=\"{height}\" fill=\"none\" stroke=\"#64748b\" stroke-width=\"4\"/><rect x=\"{left}\" y=\"{top}\" width=\"{body_width}\" height=\"{body_height}\" rx=\"72\" fill=\"none\" stroke=\"#00a7ff\" stroke-width=\"6\" stroke-dasharray=\"24 18\"/><rect x=\"0\" y=\"{jack_top:.1}\" width=\"{left}\" height=\"{jack_height}\" fill=\"#ffb347\" fill-opacity=\".16\"/><rect x=\"{right_jack_x}\" y=\"{jack_top:.1}\" width=\"{left}\" height=\"{jack_height}\" fill=\"#ffb347\" fill-opacity=\".16\"/><text x=\"{in_x}\" y=\"{jack_text_y:.1}\" fill=\"#ffb347\" font-family=\"Arial\" font-size=\"44\">IN</text><text x=\"{out_x}\" y=\"{jack_text_y:.1}\" fill=\"#ffb347\" font-family=\"Arial\" font-size=\"44\" text-anchor=\"end\">OUT</text>{controls}</svg>\n",
+        title = xml_escape(model_id),
     )
 }
 
@@ -260,13 +443,20 @@ fn xml_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn validate_control_layout(render: &ModelRenderSpec) -> anyhow::Result<()> {
+    validate_pedal_layout(render).map_err(anyhow::Error::msg)
+}
+
 fn validate_faceplate(render: &ModelRenderSpec, path: &Path) -> anyhow::Result<()> {
+    let geometry = SourceGeometry::of(render);
+    let (width, height) = (geometry.width, geometry.height);
     let image =
         image::open(path).with_context(|| format!("Could not decode {}", path.display()))?;
-    if image.dimensions() != (PEDAL_SOURCE_WIDTH, PEDAL_SOURCE_HEIGHT) {
+    if image.dimensions() != (width, height) {
         bail!(
-            "{} must be {PEDAL_SOURCE_WIDTH}x{PEDAL_SOURCE_HEIGHT}, got {}x{}",
+            "{} must be {width}x{height} for the {} format, got {}x{}",
             path.display(),
+            geometry.format.id(),
             image.width(),
             image.height()
         );
@@ -274,21 +464,21 @@ fn validate_faceplate(render: &ModelRenderSpec, path: &Path) -> anyhow::Result<(
     let rgba = image.to_rgba8();
     for (x, y) in [
         (0, 0),
-        (PEDAL_SOURCE_WIDTH - 1, 0),
-        (0, PEDAL_SOURCE_HEIGHT - 1),
-        (PEDAL_SOURCE_WIDTH - 1, PEDAL_SOURCE_HEIGHT - 1),
+        (width - 1, 0),
+        (0, height - 1),
+        (width - 1, height - 1),
     ] {
         if rgba.get_pixel(x, y)[3] != 0 {
             bail!("{} has opaque canvas corner at ({x}, {y}); faceplates require a transparent background", path.display());
         }
     }
     let alpha_bounds = alpha_bounds(&rgba).context("Faceplate has no visible enclosure pixels")?;
-    if alpha_bounds.0 < PEDAL_BODY_LEFT as u32 - 4
-        || alpha_bounds.1 < PEDAL_BODY_TOP as u32 - 4
-        || alpha_bounds.2 > PEDAL_BODY_RIGHT as u32 + 4
-        || alpha_bounds.3 > PEDAL_BODY_BOTTOM as u32 + 4
+    if alpha_bounds.0 < geometry.body_left as u32 - 4
+        || alpha_bounds.1 < geometry.body_top as u32 - 4
+        || alpha_bounds.2 > geometry.body_right as u32 + 4
+        || alpha_bounds.3 > geometry.body_bottom as u32 + 4
     {
-        bail!("{} visible pixels {:?} exceed the standard enclosure bounds; do not include a background, floor, or external shadow", path.display(), alpha_bounds);
+        bail!("{} visible pixels {:?} exceed the {} enclosure bounds; do not include a background, floor, or external shadow", path.display(), alpha_bounds, geometry.format.id());
     }
     validate_control_layout(render)?;
     Ok(())
@@ -310,163 +500,66 @@ fn alpha_bounds(image: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
     bounds
 }
 
-fn validate_control_layout(render: &ModelRenderSpec) -> anyhow::Result<()> {
-    let controls = render.controls;
-    for control in render.controls {
-        let x = control.anchor_x * PEDAL_SOURCE_WIDTH as f32;
-        let y = control.anchor_y * PEDAL_SOURCE_HEIGHT as f32;
-        let radius = control.radius * 4.0;
-        if x - radius < PEDAL_BODY_LEFT
-            || x + radius > PEDAL_BODY_RIGHT
-            || y - radius < PEDAL_BODY_TOP
-            || y + radius > PEDAL_BODY_BOTTOM
-        {
-            bail!(
-                "{} control '{}' exceeds the pedal body",
-                render.id,
-                control.label
-            );
-        }
-        if matches!(control.role, RenderControlRole::Parameter(_))
-            && label_baseline_source_y(control) > PEDAL_BODY_BOTTOM - 16.0
-        {
-            bail!(
-                "{} control '{}' leaves no room for its deterministic label",
-                render.id,
-                control.label
-            );
-        }
-
-        for other in controls {
-            if std::ptr::eq(control, other) {
-                continue;
-            }
-            let other_x = other.anchor_x * PEDAL_SOURCE_WIDTH as f32;
-            let other_y = other.anchor_y * PEDAL_SOURCE_HEIGHT as f32;
-            let other_radius = other.radius * 4.0;
-            let minimum_distance = radius + other_radius + COMPONENT_CLEARANCE;
-            if distance(x, y, other_x, other_y) < minimum_distance {
-                bail!(
-                    "{} controls '{}' and '{}' overlap (need {:.1}px centre clearance)",
-                    render.id,
-                    control.label,
-                    other.label,
-                    minimum_distance
-                );
-            }
-        }
-
-        if matches!(control.role, RenderControlRole::Parameter(_)) {
-            let label_y = label_baseline_source_y(control);
-            let label_width = label_width(control.label);
-            let label_left = x - label_width * 0.5;
-            let label_right = x + label_width * 0.5;
-            let label_top = label_y - LABEL_HEIGHT;
-            if label_left < PEDAL_BODY_LEFT + COMPONENT_CLEARANCE
-                || label_right > PEDAL_BODY_RIGHT - COMPONENT_CLEARANCE
-                || label_top < PEDAL_BODY_TOP + COMPONENT_CLEARANCE
-                || label_y > PEDAL_BODY_BOTTOM - COMPONENT_CLEARANCE
-            {
-                bail!(
-                    "{} label '{}' exceeds the printable faceplate area",
-                    render.id,
-                    control.label
-                );
-            }
-            for other in controls {
-                let other_x = other.anchor_x * PEDAL_SOURCE_WIDTH as f32;
-                let other_y = other.anchor_y * PEDAL_SOURCE_HEIGHT as f32;
-                let other_radius = other.radius * 4.0 + COMPONENT_CLEARANCE;
-                if circle_intersects_rect(
-                    other_x,
-                    other_y,
-                    other_radius,
-                    label_left,
-                    label_top,
-                    label_right,
-                    label_y,
-                ) {
-                    bail!(
-                        "{} label '{}' overlaps the '{}' component",
-                        render.id,
-                        control.label,
-                        other.label
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn label_width(label: &str) -> f32 {
-    // The UI uses compact all-caps engraving; this conservative fixed advance
-    // rejects a layout before it can become legible only by luck at a
-    // particular zoom level.
-    label.chars().count() as f32 * 30.0 + LABEL_SIDE_PADDING * 2.0
-}
-
-fn label_baseline_source_y(control: &greybound_ui::RenderControlSpec) -> f32 {
-    let y = control.anchor_y * PEDAL_SOURCE_HEIGHT as f32;
-    let standard_below = LABEL_BASELINE_OFFSET.max(control.radius * 4.0 + 80.0);
-    match control.widget {
-        // The Muffin-style vertical selectors live above the footswitch. Their
-        // labels are deliberately placed above the travel area so the physical
-        // switch can never cover the control name.
-        RenderControlWidget::Slider => y - LABEL_BASELINE_OFFSET,
-        _ => y + standard_below,
-    }
-}
-
-fn distance(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    (ax - bx).hypot(ay - by)
-}
-
-fn circle_intersects_rect(
-    circle_x: f32,
-    circle_y: f32,
-    radius: f32,
-    left: f32,
-    top: f32,
-    right: f32,
-    bottom: f32,
-) -> bool {
-    let nearest_x = circle_x.clamp(left, right);
-    let nearest_y = circle_y.clamp(top, bottom);
-    distance(circle_x, circle_y, nearest_x, nearest_y) < radius
+fn label_baseline_source_y(
+    geometry: &SourceGeometry,
+    control: &greybound_ui::RenderControlSpec,
+) -> f32 {
+    geometry.y(control.anchor_y) + pedal_label_baseline_offset(control) * PEDAL_SOURCE_SCALE
 }
 
 fn write_preview(render: &ModelRenderSpec, source: &Path, output: &Path) -> anyhow::Result<()> {
     validate_faceplate(render, source)?;
+    let geometry = SourceGeometry::of(render);
     let mut image = image::open(source)
         .with_context(|| format!("Could not decode {}", source.display()))?
         .to_rgba8();
 
     stroke_rect(
         &mut image,
-        PEDAL_BODY_LEFT as i32,
-        PEDAL_BODY_TOP as i32,
-        PEDAL_BODY_RIGHT as i32,
-        PEDAL_BODY_BOTTOM as i32,
+        geometry.body_left as i32,
+        geometry.body_top as i32,
+        geometry.body_right as i32,
+        geometry.body_bottom as i32,
         [0, 167, 255, 230],
         4,
     );
-    stroke_rect(&mut image, 0, 1018, 72, 1154, [255, 179, 71, 230], 4);
-    stroke_rect(&mut image, 1128, 1018, 1200, 1154, [255, 179, 71, 230], 4);
+    let jack_top = (geometry.jack_y - JACK_ZONE_HALF_HEIGHT).round() as i32;
+    let jack_bottom = (geometry.jack_y + JACK_ZONE_HALF_HEIGHT).round() as i32;
+    let margin = geometry.body_left as i32;
+    let width = geometry.width as i32;
+    stroke_rect(
+        &mut image,
+        0,
+        jack_top,
+        margin,
+        jack_bottom,
+        [255, 179, 71, 230],
+        4,
+    );
+    stroke_rect(
+        &mut image,
+        width - margin,
+        jack_top,
+        width,
+        jack_bottom,
+        [255, 179, 71, 230],
+        4,
+    );
 
     for control in render.controls {
-        let x = (control.anchor_x * PEDAL_SOURCE_WIDTH as f32).round() as i32;
-        let y = (control.anchor_y * PEDAL_SOURCE_HEIGHT as f32).round() as i32;
-        let radius = (control.radius * 4.0).round() as i32;
+        let x = geometry.x(control.anchor_x).round() as i32;
+        let y = geometry.y(control.anchor_y).round() as i32;
+        let radius = (control.radius * PEDAL_SOURCE_SCALE).round() as i32;
         stroke_circle(&mut image, x, y, radius, [255, 79, 216, 230], 4);
         if matches!(control.role, RenderControlRole::Parameter(_)) {
-            let width = label_width(control.label).round() as i32;
-            let baseline = label_baseline_source_y(control).round() as i32;
+            let label_width =
+                (pedal_label_width(control.label) * PEDAL_SOURCE_SCALE).round() as i32;
+            let baseline = label_baseline_source_y(&geometry, control).round() as i32;
             stroke_rect(
                 &mut image,
-                x - width / 2,
-                baseline - LABEL_HEIGHT.round() as i32,
-                x + width / 2,
+                x - label_width / 2,
+                baseline - (PEDAL_LABEL_HEIGHT * PEDAL_SOURCE_SCALE).round() as i32,
+                x + label_width / 2,
                 baseline,
                 [167, 139, 250, 230],
                 3,

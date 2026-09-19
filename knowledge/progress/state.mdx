@@ -372,6 +372,16 @@ description: Decisions and open questions that should steer upcoming implementat
   xruns, zero near-clips, and zero hard clips. The monitor log is
   `target/grey-nox-canonical-3s.monitor.log`.
 
+- 2026-09-19: pedal enclosures are standardized into three formats,
+  `Compact` (1590A class), `Standard` (125B class, the existing 1200x2172
+  canvas), and `Wide` (1590BB class), at one shared scale of 4 logical px per
+  mm. New pedals place controls with the `grid_*` builders (fixed rows and
+  columns, three knob tiers, and fixed LED, footswitch, and jack positions).
+  They cannot use hand-tuned anchors. The board lays out mixed formats at one
+  scale with a shared bottom edge. The seven baked-faceplate pedals stay
+  freeform on an allowlist that may only shrink. See
+  `knowledge/architecture/pedal-formats.mdx`.
+
 ## Open Questions
 
 - Which rig fields should be added next without mixing runtime session settings into JSON5 rig files?

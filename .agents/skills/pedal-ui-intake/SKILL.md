@@ -6,15 +6,18 @@ description: Run a structured, interactive intake before designing or generating
 # Pedal UI intake
 
 Create one model-specific layout only after the user has approved the proposed
-placement. Preserve the shared mechanical template; do not edit it unless the
-user explicitly asks to change the standard.
+placement. Every pedal uses one of the three standard formats (Compact,
+Standard, Wide) and its control grid; do not invent coordinates or sizes, and
+do not change `ui/src/pedal_format.rs` unless the user explicitly asks to
+change the standard.
 
 ## Start
 
 Read these files before asking questions:
 
 - `AGENTS.md`
-- `docs/templates/pedal-standard-1200x2172.svg`
+- `knowledge/architecture/pedal-formats.mdx`
+- the format template in `docs/templates/pedal-<format>-<w>x<h>.svg`
 - `docs/ai-asset-generation.md`
 - `docs/render-specs.md`
 
@@ -24,13 +27,15 @@ questionnaire.
 
 ## Intake order
 
-1. **Identity:** model id, displayed model name, intended pedal family, and
-   whether its labels are baked into the faceplate or drawn by the UI.
+1. **Identity:** model id, displayed model name, intended pedal family,
+   enclosure format (Compact, Standard, or Wide), and whether its labels are
+   baked into the faceplate or drawn by the UI.
 2. **Controls:** every control's label, widget type, audio role, and whether it
    is dynamic. Confirm the bypass LED and footswitch behavior.
-3. **Layout:** the desired arrangement, component sizes, and any reference
-   pedal or sketch. Translate vague placement into proposed coordinates; do
-   not silently invent final coordinates.
+3. **Layout:** the desired arrangement and any reference pedal or sketch.
+   Translate it into grid slots (row, column count, column index) and knob
+   tiers (Small, Medium, Large). The LED and footswitch positions are fixed by
+   the format.
 4. **Typography:** label text, label size, casing, colour, and whether labels
    are printed into the final faceplate. For each control, specify the label
    baseline relative to its anchor and ensure label zones do not overlap.
@@ -43,12 +48,11 @@ questionnaire.
 
 Before creating files or images, present a compact placement table with:
 
-- canvas dimensions;
-- body, side-I/O rectangle, and footswitch-cross references from the shared
-  template;
-- each control's anchor `(x, y)`, visual diameter, and label baseline;
+- format, canvas dimensions, and body size in mm;
+- each control's grid slot, knob tier, and resulting anchor and label baseline;
 - every printed label and its bounding zone;
-- any deliberate exception to the shared mechanical standard.
+- confirmation that `validate_pedal_layout` accepts the layout (no exceptions
+  to the standard grid).
 
 Ask for explicit approval of this table. Revise it until approved.
 
